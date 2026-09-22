@@ -10,7 +10,7 @@ SEEDS=(42 123 1993)
 
 for SEED in "${SEEDS[@]}"
 do
-    OUT_DIR="./layoutlmv3-large-finetuned-funsd-segctx-seed${SEED}"
+    OUT_DIR="./funsd-large-bdr-seed${SEED}"
 
     echo ""
     echo "============================================================"
@@ -46,7 +46,11 @@ do
       --overwrite_cache \
       --use_hierarchical_position_encoding \
       --max_line_position 100 \
-      --max_block_position 30
+      --max_block_position 30 \
+      --use_column_encoding True \
+      --max_column_position 8 \
+      --use_intra_line_boundary True \
+      --lambda_bound_init 0.1
 
 done
 
@@ -61,6 +65,7 @@ import json
 import numpy as np
 
 seeds = [42, 123, 1993]
+
 metrics = [
     "eval_accuracy",
     "eval_f1",
@@ -72,11 +77,12 @@ metrics = [
 results = {m: [] for m in metrics}
 
 for seed in seeds:
-    path = f"./layoutlmv3-large-finetuned-cord-segctx-seed{seed}/eval_results.json"
-    print(f"\nSeed {seed}:")
+    path = "./logs/funsd-large-bdr-seed{}/eval_results.json".format(seed)
+
+    print("\nSeed {}:".format(seed))
 
     if not os.path.exists(path):
-        print(f"  [WARNING] Missing: {path}")
+        print("  [WARNING] Missing:", path)
         continue
 
     with open(path, "r") as f:
@@ -89,20 +95,38 @@ for seed in seeds:
             print("  {:18s} = {:.6f}".format(metric, value))
 
 print("\n" + "=" * 70)
-print("FINAL RESULT: MEAN ± STD")
+print("FINAL HIPOS RESULT: MEAN ± STD")
 print("=" * 70)
 
 summary = {}
+
 for metric in metrics:
     values = results[metric]
     if not values:
+        print("{:18s}: NO DATA".format(metric))
         continue
+
     mean = np.mean(values)
     std = np.std(values, ddof=1) if len(values) > 1 else 0.0
-    print("{:18s}: {:.4f} ± {:.4f}".format(metric, mean, std))
-    summary[metric] = {"values": values, "mean": float(mean), "std": float(std)}
 
-with open("funsd_lisc_3seed_summary.json", "w") as f:
+    print(
+        "{:18s}: {:.4f} ± {:.4f}".format(
+            metric,
+            mean,
+            std
+        )
+    )
+
+    summary[metric] = {
+        "values": values,
+        "mean": float(mean),
+        "std": float(std),
+    }
+
+output_summary_file = "./logs/funsd-large-bdr-seed{}/funsd_large_bdr_3seed_summary.json".format(seed)
+with open(output_summary_file, "w") as f:
     json.dump(summary, f, indent=2)
 
+print("=" * 70)
+print("Saved:", output_summary_file)
 PY

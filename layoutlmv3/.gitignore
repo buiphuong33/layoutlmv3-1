@@ -309,8 +309,6 @@ $RECYCLE.BIN/
 /models/
 /wandb/
 /output/
-/layoutlmv3-large-finetuned-funsd-segctx-seed42/
-/layoutlmv3-large-finetuned-funsd-segctx-seed123/
-/layoutlmv3-large-finetuned-funsd-segctx-seed1993/
 /cord-lisc-base-seed42/
 /checkpoints/
+/logs/

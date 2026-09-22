@@ -109,11 +109,27 @@ class LayoutLMv3Embeddings(nn.Module):
             self.block_position_embeddings = nn.Embedding(
                 config.max_block_position, config.coordinate_size
             )
-            # Project để align với hidden_size
-            self.hierarchical_proj = nn.Linear(config.coordinate_size * 2, config.hidden_size)
+            if getattr(config, "use_column_encoding", False):
+                self.column_position_embeddings = nn.Embedding(
+                    config.max_column_position,
+                    config.coordinate_size
+                )
+                self.hierarchical_proj = nn.Linear(
+                    config.coordinate_size * 3,  # line + block + column
+                    config.hidden_size
+                )
+            else:
+                self.column_position_embeddings = None
+                self.hierarchical_proj = nn.Linear(
+                    config.coordinate_size * 2,  # line + block
+                    config.hidden_size
+                )
+    
         else:
             self.line_position_embeddings = None
             self.block_position_embeddings = None
+            self.column_position_embeddings = None
+            self.hierarchical_proj = None
 
     def _calc_spatial_position_embeddings(self, bbox):
         try:
@@ -167,6 +183,7 @@ class LayoutLMv3Embeddings(nn.Module):
         past_key_values_length=0,
         line_ids=None,      
         block_ids=None,
+        column_ids=None,
     ):
         if position_ids is None:
             if input_ids is not None:
@@ -218,20 +235,29 @@ class LayoutLMv3Embeddings(nn.Module):
             
             line_emb = self.line_position_embeddings(line_ids_clamped)
             block_emb = self.block_position_embeddings(block_ids_clamped)
-            hierarchical_emb = torch.cat([line_emb, block_emb], dim=-1)
-            hierarchical_emb = self.hierarchical_proj(hierarchical_emb)
-            
-            # Đảm bảo hierarchical_emb có cùng shape với embeddings
-            if hierarchical_emb.shape[1] != embeddings.shape[1]:
-                if hierarchical_emb.shape[1] > embeddings.shape[1]:
-                    hierarchical_emb = hierarchical_emb[:, :embeddings.shape[1], :]
-                else:
-                    pad_len = embeddings.shape[1] - hierarchical_emb.shape[1]
-                    pad_zeros = torch.zeros(hierarchical_emb.shape[0], pad_len, hierarchical_emb.shape[2], device=hierarchical_emb.device)
-                    hierarchical_emb = torch.cat([hierarchical_emb, pad_zeros], dim=1)
-            
-            embeddings = embeddings + hierarchical_emb
+            if self.column_position_embeddings is not None and column_ids is not None:
+                column_ids_clamped = torch.clamp(column_ids, 0, self.column_position_embeddings.num_embeddings - 1)
+                column_emb = self.column_position_embeddings(column_ids_clamped)
+                column_weight = 0.3
+                column_emb = column_weight * column_emb
+                concat_emb = torch.cat([line_emb, block_emb, column_emb], dim=-1)
+            else:
+                concat_emb = torch.cat([line_emb, block_emb], dim=-1)
+            hier_emb = self.hierarchical_proj(concat_emb)
         
+            # Đảm bảo cùng shape
+            if hier_emb.shape[1] == embeddings.shape[1]:
+                embeddings = embeddings + hier_emb
+            elif hier_emb.shape[1] > embeddings.shape[1]:
+                embeddings = embeddings + hier_emb[:, :embeddings.shape[1], :]
+            else:
+                pad_len = embeddings.shape[1] - hier_emb.shape[1]
+                pad_zeros = torch.zeros(hier_emb.shape[0], pad_len, hier_emb.shape[2], device=hier_emb.device)
+                hier_emb_padded = torch.cat([hier_emb, pad_zeros], dim=1)
+                embeddings = embeddings + hier_emb_padded
+        
+        embeddings = self.LayerNorm(embeddings)
+        embeddings = self.dropout(embeddings)
         return embeddings
 
     def create_position_ids_from_inputs_embeds(self, inputs_embeds):
@@ -869,6 +895,7 @@ class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
         images=None,
         line_ids=None,      # NEW
         block_ids=None, 
+        column_ids=None,
     ):
         r"""
         encoder_hidden_states  (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
@@ -955,6 +982,14 @@ class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
                     else:
                         pad_len = input_shape[1] - block_ids.shape[1]
                         block_ids = torch.cat([block_ids, torch.ones(block_ids.shape[0], pad_len, device=device, dtype=block_ids.dtype) * -1], dim=1)
+            if column_ids is not None:
+                if column_ids.shape[1] != input_shape[1]:
+                    if column_ids.shape[1] > input_shape[1]:
+                        column_ids = column_ids[:, :input_shape[1]]
+                    else:
+                        pad_len = input_shape[1] - column_ids.shape[1]
+                        column_ids = torch.cat([column_ids, torch.ones(column_ids.shape[0], pad_len, device=device, dtype=column_ids.dtype) * -1], dim=1)
+
             embedding_output = self.embeddings(
                 input_ids=input_ids,
                 bbox=bbox,
@@ -964,6 +999,7 @@ class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
                 past_key_values_length=past_key_values_length,
                 line_ids=line_ids,    # NEW
                 block_ids=block_ids,  # NEW
+                column_ids=column_ids,
             )
 
         final_bbox = final_position_ids = None

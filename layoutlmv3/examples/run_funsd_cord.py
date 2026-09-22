@@ -78,6 +78,34 @@ class ModelArguments:
         default=20,
         metadata={"help": "Maximum number of blocks in a document for HPE"}
     )
+    use_column_encoding: bool = field(
+        default=False,
+        metadata={"help": "Enable Column Position Encoding"}
+    )
+    max_column_position: int = field(
+        default=10,
+        metadata={"help": "Maximum number of columns in a document"}
+    )
+    use_intra_line_boundary: bool = field(
+        default=False,
+        metadata={"help": "Enable Intra-Line Boundary Transition Parsing"}
+    )
+    lambda_bound_init: float = field(
+        default=0.1,
+        metadata={"help": "Initial weight for boundary loss"}
+    )
+    use_semantic_geometry_disentangle: bool = field(
+        default=False,
+        metadata={"help": "Enable Semantic-Geometry Disentanglement"}
+    )
+    lambda_geo_init: float = field(
+        default=0.1,
+        metadata={"help": "Initial weight for geometry loss"}
+    )
+    lambda_orth_init: float = field(
+        default=0.1,
+        metadata={"help": "Initial weight for orthogonality loss"}
+    )
 
 
 @dataclass
@@ -281,6 +309,13 @@ def main():
         use_hierarchical_position_encoding=model_args.use_hierarchical_position_encoding,
         max_line_position=model_args.max_line_position,
         max_block_position=model_args.max_block_position,
+        use_column_encoding=model_args.use_column_encoding,
+        max_column_position=model_args.max_column_position,
+        use_intra_line_boundary=model_args.use_intra_line_boundary,
+        lambda_bound_init=model_args.lambda_bound_init,
+        use_semantic_geometry_disentangle=model_args.use_semantic_geometry_disentangle,
+        lambda_geo_init=model_args.lambda_geo_init,
+        lambda_orth_init=model_args.lambda_orth_init,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
@@ -361,6 +396,7 @@ def main():
         seg_ids = []
         line_ids_all = []    # NEW
         block_ids_all = []   # NEW
+        column_ids_all = []
         
         # Helper function để tính line_ids từ bbox
         def compute_line_ids(bboxes, y_threshold=10):
@@ -398,6 +434,24 @@ def main():
                     current_block += 1
                 blocks.append(current_block)
             return blocks
+        def compute_column_ids(bboxes, x_threshold=50):
+            """Gom các token theo cột dựa trên x_center"""
+            if not bboxes:
+                return []
+            # Tính x_center của mỗi token
+            x_centers = [(box[0] + box[2]) / 2 for box in bboxes]
+            
+            # Sắp xếp các token theo x_center
+            columns = []
+            current_col = 0
+            columns.append(current_col)
+            
+            for i in range(1, len(x_centers)):
+                # Nếu khoảng cách x lớn hơn ngưỡng → cột mới
+                if abs(x_centers[i] - x_centers[i-1]) > x_threshold:
+                    current_col += 1
+                columns.append(current_col)
+            return columns
         
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
@@ -409,6 +463,7 @@ def main():
             # NEW: Tính line_ids và block_ids cho các token gốc
             line_ids_orig = compute_line_ids(bbox)
             block_ids_orig = compute_block_ids(bbox)
+            column_ids_orig = compute_column_ids(bbox, x_threshold=50)
 
             # NEW: recover segment boundaries (giữ nguyên code cũ)
             word_seg_id = None
@@ -429,6 +484,7 @@ def main():
             seg_id_inputs = []
             line_ids_aligned = []    # NEW
             block_ids_aligned = []   # NEW
+            column_ids_aligned = []
             
             for word_idx in word_ids:
                 if word_idx is None:
@@ -439,6 +495,7 @@ def main():
                         seg_id_inputs.append(-1)
                     line_ids_aligned.append(-1)     # NEW
                     block_ids_aligned.append(-1)    # NEW
+                    column_ids_aligned.append(-1)
                 elif word_idx != previous_word_idx:
                     # First token of a word
                     label_ids.append(label_to_id[label[word_idx]])
@@ -447,6 +504,7 @@ def main():
                         seg_id_inputs.append(word_seg_id[word_idx])
                     line_ids_aligned.append(line_ids_orig[word_idx])     # NEW
                     block_ids_aligned.append(block_ids_orig[word_idx])   # NEW
+                    column_ids_aligned.append(column_ids_orig[word_idx])
                 else:
                     # Subsequent tokens of the same word
                     label_ids.append(label_to_id[label[word_idx]] if data_args.label_all_tokens else -100)
@@ -455,6 +513,7 @@ def main():
                         seg_id_inputs.append(word_seg_id[word_idx])
                     line_ids_aligned.append(line_ids_orig[word_idx])     # NEW
                     block_ids_aligned.append(block_ids_orig[word_idx])   # NEW
+                    column_ids_aligned.append(column_ids_orig[word_idx])
                 previous_word_idx = word_idx
                 
             labels.append(label_ids)
@@ -463,6 +522,7 @@ def main():
                 seg_ids.append(seg_id_inputs)
             line_ids_all.append(line_ids_aligned)     # NEW
             block_ids_all.append(block_ids_aligned)   # NEW
+            column_ids_all.append(column_ids_aligned)
 
             if data_args.visual_embed:
                 ipath = examples["image_path"][org_batch_index]
@@ -475,6 +535,7 @@ def main():
         tokenized_inputs["bbox"] = bboxes
         tokenized_inputs["line_ids"] = line_ids_all    # NEW
         tokenized_inputs["block_ids"] = block_ids_all  # NEW
+        tokenized_inputs["column_ids"] = column_ids_all
         
         if getattr(data_args, "use_segment_head", False):
             tokenized_inputs["seg_id"] = seg_ids
