@@ -397,6 +397,30 @@ def main():
         line_ids_all = []    # NEW
         block_ids_all = []   # NEW
         column_ids_all = []
+        entity_ids_all = []
+
+        # Thêm vào tokenize_and_align_labels, cùng chỗ tính label_ids
+        def compute_entity_ids(label_ids_aligned, label_list):
+            """Gán 1 ID duy nhất cho mỗi entity liên tục, dựa trên chuỗi nhãn thật
+            (không suy luận theo số chẵn/lẻ) -> tổng quát cho mọi dataset/label order."""
+            entity_ids = []
+            current_id = -1
+            prev_type = None  # None nghĩa là đang ở "O" hoặc đầu chuỗi
+            for lid in label_ids_aligned:
+                if lid == -100:
+                    entity_ids.append(-1)
+                    continue
+                label_str = label_list[lid]
+                if label_str == "O":
+                    entity_ids.append(-1)
+                    prev_type = None
+                    continue
+                prefix, etype = label_str.split("-", 1)  # "B"/"I", "QUESTION"/...
+                if prefix == "B" or etype != prev_type:
+                    current_id += 1
+                entity_ids.append(current_id)
+                prev_type = etype
+            return entity_ids
         
         # Helper function để tính line_ids từ bbox
         def compute_line_ids(bboxes, y_threshold=10):
@@ -524,6 +548,9 @@ def main():
             block_ids_all.append(block_ids_aligned)   # NEW
             column_ids_all.append(column_ids_aligned)
 
+            entity_ids_aligned = compute_entity_ids(label_ids, label_list)  # NEW
+            entity_ids_all.append(entity_ids_aligned)
+
             if data_args.visual_embed:
                 ipath = examples["image_path"][org_batch_index]
                 img = pil_loader(ipath)
@@ -536,7 +563,8 @@ def main():
         tokenized_inputs["line_ids"] = line_ids_all    # NEW
         tokenized_inputs["block_ids"] = block_ids_all  # NEW
         tokenized_inputs["column_ids"] = column_ids_all
-        
+        tokenized_inputs["entity_ids"] = entity_ids_all  # NEW
+
         if getattr(data_args, "use_segment_head", False):
             tokenized_inputs["seg_id"] = seg_ids
         if data_args.visual_embed:

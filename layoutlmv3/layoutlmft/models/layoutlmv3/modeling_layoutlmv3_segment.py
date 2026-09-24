@@ -74,12 +74,13 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 nn.ReLU(),
                 nn.Linear(config.hidden_size, 1)
             )
-            self.lambda_bound = nn.Parameter(
-                torch.tensor(getattr(config, "lambda_bound_init", 0.1))
-            )
+            # Float cố định, không phải Parameter -- tránh bị gradient descent
+            # đẩy xuống âm (sẽ đảo ngược mục đích của boundary loss), nhất
+            # quán với cách xử lý lambda_geo/lambda_orth ở dưới.
+            self.lambda_bound = float(getattr(config, "lambda_bound_init", 0.1))
         else:
             self.boundary_classifier = None
-            self.lambda_bound = None
+            self.lambda_bound = 0.0
         
         # ====== SEMANTIC-GEOMETRY DISENTANGLE ======
         if getattr(config, "use_semantic_geometry_disentangle", False):
@@ -169,86 +170,43 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
                 broadcast_hidden[b, mask] = seg_vecs_ctx[i]
 
         return broadcast_hidden
-    def _compute_boundary_loss(self, text_hidden, line_ids, labels, attention_mask, text_len):
+    def _compute_boundary_loss(self, text_hidden, entity_ids, attention_mask, text_len):
         """
-        Tính Intra-Line Boundary Loss.
-        
-        Với mỗi cặp token liên tiếp cùng dòng:
-        - Label = 0 nếu cùng entity
-        - Label = 1 nếu khác entity
+        Intra-Line/Entity Boundary Loss -- bản vector hóa, dùng entity_ids
+        (đã tính sẵn từ chuỗi nhãn thật "B-.../I-...", không suy luận theo
+        số chẵn/lẻ -> tổng quát cho mọi dataset).
+
+        Với mỗi cặp token liên tiếp (i, i+1):
+            boundary_label = 0  nếu cùng entity_ids (đang ở giữa 1 entity)
+            boundary_label = 1  nếu khác entity_ids (ranh giới thật)
+        Token có entity_ids = -1 (O / special / padding) bị loại khỏi loss.
         """
         device = text_hidden.device
-        B = text_hidden.shape[0]
-        
-        boundary_loss = 0.0
-        n_pairs = 0
-        
-        for b in range(B):
-            for i in range(text_len - 1):
-                # Kiểm tra token hợp lệ
-                if attention_mask is not None:
-                    if attention_mask[b, i] != 1 or attention_mask[b, i+1] != 1:
-                        continue
-                
-                # Kiểm tra cùng dòng
-                if line_ids is not None:
-                    if line_ids[b, i] < 0 or line_ids[b, i+1] < 0:
-                        continue
-                    if line_ids[b, i] != line_ids[b, i+1]:
-                        continue
-                
-                # Kiểm tra label hợp lệ
-                if labels[b, i] < 0 or labels[b, i+1] < 0:
-                    continue
-                
-                # Tạo feature cho cặp
-                h_pair = torch.cat([text_hidden[b, i], text_hidden[b, i+1]], dim=-1)
-                boundary_logit = self.boundary_classifier(h_pair).squeeze(-1)
-                
-                # Xác định label boundary
-                label_i = labels[b, i].item()
-                label_i_next = labels[b, i+1].item()
-                
-                # Cùng entity nếu:
-                # - Cả 2 cùng label (cùng I-X)
-                # - Hoặc label_i là B-X và label_i_next là I-X
-                same_entity = False
-                
-                # Case 1: Cả 2 cùng label
-                if label_i == label_i_next:
-                    # Nhưng nếu cả 2 đều là B-X thì khác entity
-                    # (vì B- là bắt đầu entity mới)
-                    # Giả sử label_list có dạng: O, B-X, I-X
-                    # Ta cần biết label_i có phải B- không
-                    # Đơn giản: nếu label_i % 2 == 0 thì là B- hoặc O
-                    # (tùy vào label_list cụ thể)
-                    if label_i == 0:  # O
-                        same_entity = True
-                    # Nếu label_i là B- (thường là label chẵn), thì label_i_next 
-                    # cũng B- → khác entity
-                    # Ta cần kiểm tra cụ thể hơn
-                    same_entity = (label_i == label_i_next)
-                
-                # Case 2: label_i là B-X, label_i_next là I-X
-                # Trong FUNSD: O=0, B-HEADER=1, I-HEADER=2, B-QUESTION=3, I-QUESTION=4, ...
-                # B-X có label lẻ, I-X có label chẵn (label_i + 1)
-                if label_i % 2 == 1 and label_i_next == label_i + 1:
-                    same_entity = True
-                
-                boundary_label = 0.0 if same_entity else 1.0
-                
-                boundary_loss += F.binary_cross_entropy_with_logits(
-                    boundary_logit, 
-                    torch.tensor(boundary_label, device=device)
-                )
-                n_pairs += 1
-        
-        if n_pairs > 0:
-            boundary_loss = boundary_loss / n_pairs
-        else:
-            boundary_loss = torch.tensor(0.0, device=device)
-        
-        return boundary_loss
+
+        if entity_ids is None:
+            return torch.tensor(0.0, device=device)
+
+        h_i = text_hidden[:, :-1, :]        # (B, L-1, H)
+        h_next = text_hidden[:, 1:, :]      # (B, L-1, H)
+        h_pair = torch.cat([h_i, h_next], dim=-1)                    # (B, L-1, 2H)
+        boundary_logits = self.boundary_classifier(h_pair).squeeze(-1)  # (B, L-1)
+
+        ent_i = entity_ids[:, :-1]
+        ent_next = entity_ids[:, 1:]
+
+        valid = (ent_i >= 0) & (ent_next >= 0)
+        if attention_mask is not None:
+            am = attention_mask[:, :text_len]
+            valid = valid & (am[:, :-1] == 1) & (am[:, 1:] == 1)
+
+        if valid.sum() == 0:
+            return torch.tensor(0.0, device=device)
+
+        boundary_labels = (ent_i != ent_next).float()
+
+        return F.binary_cross_entropy_with_logits(
+            boundary_logits[valid], boundary_labels[valid]
+        )
 
     def _compute_disentangle_loss(self, text_hidden, line_ids, block_ids, 
                                 attention_mask, text_len):
@@ -328,7 +286,8 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         seg_id=None,
         line_ids=None,
         block_ids=None,
-        column_ids=None, 
+        column_ids=None,
+        entity_ids=None, 
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
@@ -400,10 +359,21 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         if labels is not None:
             # ====== INTRA-LINE BOUNDARY LOSS ======
             if self.boundary_classifier is not None:
+                entity_ids_for_loss = entity_ids
+                if entity_ids_for_loss is not None and entity_ids_for_loss.shape[1] != text_len:
+                    if entity_ids_for_loss.shape[1] > text_len:
+                        entity_ids_for_loss = entity_ids_for_loss[:, :text_len]
+                    else:
+                        pad_len = text_len - entity_ids_for_loss.shape[1]
+                        pad_tensor = torch.ones(
+                            entity_ids_for_loss.shape[0], pad_len,
+                            device=entity_ids_for_loss.device, dtype=entity_ids_for_loss.dtype
+                        ) * -1
+                        entity_ids_for_loss = torch.cat([entity_ids_for_loss, pad_tensor], dim=1)
+
                 boundary_loss = self._compute_boundary_loss(
                     text_hidden=sequence_output[:, :text_len, :],
-                    line_ids=line_ids if line_ids is not None else None,
-                    labels=labels,
+                    entity_ids=entity_ids_for_loss,   # thay labels bằng entity_ids đã tính đúng
                     attention_mask=attention_mask,
                     text_len=text_len,
                 )
