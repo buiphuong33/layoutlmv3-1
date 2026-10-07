@@ -1,43 +1,71 @@
-#layoutlmft/models/layoutlmv3/modeling_layoutlmv3_segment.py
 # coding=utf-8
-#modeling_layoutlmv3_segment.py
 """
 LayoutLMv3ForSegmentTokenClassification
 
-Core idea (grounded in error analysis on FUNSD + CORD):
-  - Segment self-consistency is already ~98-99% solved by the base model
-    (confirmed empirically) -> a consistency REGULARIZER has little to gain.
-  - The real errors are (a) whole segments classified wrong as a unit
-    (esp. long free-text spans dropped entirely via BIO "drift"), and
-    (b) confusions that depend on the NEIGHBORING segment's role
-    (HEADER vs QUESTION on FUNSD; parent vs sub-item on CORD).
-  - Fix: pool each segment's token hidden states into one vector, run a
-    tiny Transformer encoder over the SEQUENCE of segment vectors (reading
-    order) so adjacent segments exchange information, then broadcast the
-    context-enriched vector back to every token in the segment before the
-    (unchanged) token classifier.
-  - To keep the existing BIO scheme / seqeval / compute_metrics pipeline
-    100% unchanged, we do NOT collapse labels to entity-type-only. Instead
-    we add a tiny learned "is-first-token-of-segment" embedding so the
-    (otherwise identical) broadcast vector can still support the B-/I-
-    distinction at the classifier.
+Conservative segment + token late-fusion model for FUNSD/CORD.
 
-This class does NOT touch attention, does NOT build any graph/hypergraph,
-and does NOT modify the pretrained backbone. It only replaces what the
-token classifier head "sees" for tokens inside multi-token segments -- an
-orthogonal mechanism to HGA / GraphLayoutLM.
+Motivation:
+  The strongest observed segment model in this project uses:
+      h_i -> mean pool by segment -> inter-segment context -> broadcast
+      -> first-token embedding -> classifier
+
+  Several later variants became worse after changing the hidden representation
+  itself or adding a large extra classifier branch. This version therefore
+  keeps the original segment representation as the MAIN path and introduces
+  only a small late token shortcut.
+
+Architecture:
+
+  Backbone token states:
+      h_i
+
+  Segment path:
+      s_k = mean(h_i in segment k)
+      c_k = Transformer(s_k + segment-position)
+      s'_k = s_k + g * (c_k - s_k)
+      z_seg_i = s'_k + first_token_embedding(i)
+      logits_seg_i = Classifier(z_seg_i)
+
+  Token path:
+      z_tok_i = h_i + first_token_embedding(i)
+      logits_tok_i = Classifier(z_tok_i)
+
+  Final logits:
+      logits_i = logits_seg_i
+                 + alpha * (logits_tok_i - logits_seg_i)
+
+  The token shortcut is activated only for NON-FIRST tokens inside
+  multi-token segments. This preserves the strong segment decision for the
+  first B-token while allowing the following I-tokens to recover their own
+  token-level information.
+
+  alpha starts very close to zero, so the model starts essentially as the
+  previously working hard-segment model. There is only ONE new trainable
+  scalar and no extra classifier/MLP.
+
+Why this is deliberately conservative:
+  - No adaptive pooling.
+  - No within-segment positional embedding.
+  - No token residual hidden-state projection.
+  - No auxiliary loss.
+  - No second classifier with independent parameters.
+  - The original segment path remains the dominant path.
+
+This file keeps the same interface expected by run_funsd_cord.py and is meant
+for use through --use_segment_head only.
 """
+
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 from transformers.modeling_outputs import TokenClassifierOutput
-import torch.nn.functional as F
 
 from .modeling_layoutlmv3 import (
     LayoutLMv3ClassificationHead,
     LayoutLMv3Model,
     LayoutLMv3PreTrainedModel,
 )
+
 
 class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"pooler"]
@@ -47,18 +75,56 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         super().__init__(config)
         self.num_labels = config.num_labels
 
+        # ------------------------------------------------------------------
+        # LayoutLMv3 backbone + original classifier
+        # ------------------------------------------------------------------
         self.layoutlmv3 = LayoutLMv3Model(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        if config.num_labels < 10:
-            self.classifier = nn.Linear(config.hidden_size, config.num_labels)
-        else:
-            self.classifier = LayoutLMv3ClassificationHead(config, pool_feature=False)
 
-        # ---- NEW: lightweight inter-segment context module ----
-        # Config knobs (optional; safe defaults if not set on the config object).
-        seg_ctx_layers = getattr(config, "segment_context_layers", 1)
-        seg_ctx_heads = getattr(config, "segment_context_heads", 4)
-        seg_ctx_dropout = getattr(config, "segment_context_dropout", config.hidden_dropout_prob)
+        if config.num_labels < 10:
+            self.classifier = nn.Linear(
+                config.hidden_size,
+                config.num_labels,
+            )
+        else:
+            self.classifier = LayoutLMv3ClassificationHead(
+                config,
+                pool_feature=False,
+            )
+
+        # ------------------------------------------------------------------
+        # Inter-segment context: same core mechanism as the strong segment
+        # model used earlier in this project.
+        # ------------------------------------------------------------------
+        seg_ctx_layers = int(
+            getattr(config, "segment_context_layers", 1)
+        )
+        seg_ctx_heads = int(
+            getattr(config, "segment_context_heads", 4)
+        )
+        seg_ctx_dropout = float(
+            getattr(
+                config,
+                "segment_context_dropout",
+                config.hidden_dropout_prob,
+            )
+        )
+        max_seg_pos = int(
+            getattr(config, "segment_context_max_positions", 128)
+        )
+
+        if seg_ctx_layers <= 0:
+            raise ValueError("segment_context_layers must be > 0")
+        if seg_ctx_heads <= 0:
+            raise ValueError("segment_context_heads must be > 0")
+        if config.hidden_size % seg_ctx_heads != 0:
+            raise ValueError(
+                "segment_context_heads must divide hidden_size: "
+                f"hidden_size={config.hidden_size}, "
+                f"segment_context_heads={seg_ctx_heads}"
+            )
+        if max_seg_pos <= 0:
+            raise ValueError("segment_context_max_positions must be > 0")
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=config.hidden_size,
@@ -67,210 +133,213 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             dropout=seg_ctx_dropout,
             batch_first=True,
         )
-        self.segment_context = nn.TransformerEncoder(encoder_layer, num_layers=seg_ctx_layers)
-        if getattr(config, "use_intra_line_boundary", False):
-            self.boundary_classifier = nn.Sequential(
-                nn.Linear(config.hidden_size * 2, config.hidden_size),
-                nn.ReLU(),
-                nn.Linear(config.hidden_size, 1)
-            )
-            # Float cố định, không phải Parameter -- tránh bị gradient descent
-            # đẩy xuống âm (sẽ đảo ngược mục đích của boundary loss), nhất
-            # quán với cách xử lý lambda_geo/lambda_orth ở dưới.
-            self.lambda_bound = float(getattr(config, "lambda_bound_init", 0.1))
-        else:
-            self.boundary_classifier = None
-            self.lambda_bound = 0.0
-        
-        # ====== SEMANTIC-GEOMETRY DISENTANGLE ======
-        if getattr(config, "use_semantic_geometry_disentangle", False):
-            self.geo_head = nn.Linear(config.hidden_size, config.hidden_size)
-            self.geo_line_classifier = nn.Linear(config.hidden_size, config.max_line_position)
-            self.geo_block_classifier = nn.Linear(config.hidden_size, config.max_block_position)
-            self.semi_head = nn.Linear(config.hidden_size, config.hidden_size)
-            
-            # ====== SỬA: Dùng float thay vì Parameter ======
-            self.lambda_geo = float(getattr(config, "lambda_geo_init", 0.1))
-            self.lambda_orth = float(getattr(config, "lambda_orth_init", 0.1))
-        else:
-            self.geo_head = None
-            self.geo_line_classifier = None
-            self.geo_block_classifier = None
-            self.semi_head = None
-            self.lambda_geo = 0.0
-            self.lambda_orth = 0.0
-                # ReZero-style gate: starts at 0 so at step 0 the context module is a
-        # NO-OP (output == plain mean-pooled vector, i.e. identical to a
-        # "segment pooling only, no inter-segment context" ablation). Training
-        # then gradually learns how much of the (initially random) context
-        # transform to blend in. This avoids injecting a large random
-        # perturbation into a well-pretrained backbone's features right at
-        # the start of fine-tuning -- important on tiny datasets like FUNSD
-        # (149 docs) where a high-variance early gradient can permanently
-        # damage the pretrained representation.
+        self.segment_context = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=seg_ctx_layers,
+        )
+        self.segment_position_embedding = nn.Embedding(
+            max_seg_pos,
+            config.hidden_size,
+        )
+
+        # ReZero gate. At initialization the context Transformer contributes
+        # nothing, preserving the mean-pooled segment representation.
         self.segment_context_gate = nn.Parameter(torch.zeros(1))
 
-        # Small embedding so the classifier can still tell "first token of the
-        # segment" (-> should predict B-xxx) apart from the rest (-> I-xxx),
-        # even though every token in the segment otherwise shares one pooled
-        # vector. Initialized near zero so early training resembles the
-        # unmodified baseline.
-        self.is_first_token_embedding = nn.Embedding(2, config.hidden_size)
-        nn.init.normal_(self.is_first_token_embedding.weight, mean=0.0, std=0.02)
+        # ------------------------------------------------------------------
+        # Existing BIO-preserving first-token cue.
+        # ------------------------------------------------------------------
+        self.is_first_token_embedding = nn.Embedding(
+            2,
+            config.hidden_size,
+        )
 
+        # ------------------------------------------------------------------
+        # NEW: one scalar controlling late token shortcut.
+        # ------------------------------------------------------------------
+        # We use a bounded positive coefficient. The initialization is small,
+        # but not exactly zero, so the scalar has a healthy gradient from step
+        # 1. With max=0.15 and raw=-2, alpha ~= 0.018.
+        self.token_blend_max = float(
+            getattr(config, "token_blend_max", 0.15)
+        )
+        if not (0.0 < self.token_blend_max <= 0.5):
+            raise ValueError(
+                "token_blend_max must be in (0, 0.5], got "
+                f"{self.token_blend_max}"
+            )
+        self.token_blend_raw = nn.Parameter(
+            torch.tensor(-1.3863, dtype=torch.float32)
+        )
+
+        # ------------------------------------------------------------------
+        # Initialization
+        # ------------------------------------------------------------------
         self.init_weights()
-        # for param in self.layoutlmv3.parameters():
-        #     param.requires_grad = False
 
-    def _segment_pool_and_contextualize(self, text_hidden, seg_id):
-        """
-        text_hidden: (B, L, H) hidden states for the TEXT part only
-                     (image-patch positions, if any, are handled separately
-                     by the caller and never enter this function).
-        seg_id:      (B, L) long tensor. -1 marks tokens that do not belong
-                     to any segment (special tokens / padding). Non-negative
-                     values are LOCAL segment indices per example, assigned
-                     in reading order (0, 1, 2, ...), exactly matching the
-                     bbox-equality grouping used in run_funsd_cord.py's
-                     tokenize_and_align_labels (see patch).
+        with torch.no_grad():
+            self.segment_context_gate.zero_()
+            self.segment_position_embedding.weight.normal_(
+                mean=0.0,
+                std=0.02,
+            )
+            self.is_first_token_embedding.weight.normal_(
+                mean=0.0,
+                std=0.02,
+            )
 
-        Returns:
-            broadcast_hidden: (B, L, H) -- every token belonging to the same
-                segment gets an IDENTICAL context-enriched vector (before the
-                is-first-token embedding is added back in `forward`).
+    @staticmethod
+    def _normalize_seg_id(seg_id, text_len):
+        """Return seg_id with shape (B, text_len), padding with -1."""
+        if seg_id is None:
+            return None
+
+        if seg_id.ndim != 2:
+            raise ValueError(
+                f"seg_id must be 2-D, got shape={tuple(seg_id.shape)}"
+            )
+
+        if seg_id.shape[1] == text_len:
+            return seg_id
+
+        if seg_id.shape[1] > text_len:
+            return seg_id[:, :text_len]
+
+        pad_len = text_len - seg_id.shape[1]
+        pad = torch.full(
+            (seg_id.shape[0], pad_len),
+            -1,
+            device=seg_id.device,
+            dtype=seg_id.dtype,
+        )
+        return torch.cat([seg_id, pad], dim=1)
+
+    @staticmethod
+    def _build_first_token_flags(seg_id):
+        """1 for the first valid token of each segment, else 0."""
+        flags = torch.zeros_like(seg_id, dtype=torch.long)
+        if seg_id.shape[1] == 0:
+            return flags
+
+        valid = seg_id >= 0
+        flags[:, 0] = valid[:, 0].long()
+
+        if seg_id.shape[1] > 1:
+            prev = seg_id[:, :-1]
+            cur = seg_id[:, 1:]
+            flags[:, 1:] = (
+                (cur >= 0)
+                & (cur != prev)
+            ).long()
+
+        return flags
+
+    @staticmethod
+    def _build_nonfirst_multitoken_mask(seg_id):
         """
-        B, L, H = text_hidden.shape
-        device = text_hidden.device
-        broadcast_hidden = text_hidden.clone()
+        True only for tokens that:
+          1) belong to a valid segment,
+          2) are NOT the first token of that segment,
+          3) belong to a segment containing at least two tokens.
+
+        This intentionally excludes the first B-token of every segment.
+        """
+        B, L = seg_id.shape
+        mask_out = torch.zeros(
+            B,
+            L,
+            device=seg_id.device,
+            dtype=torch.bool,
+        )
 
         for b in range(B):
             ids = seg_id[b]
             valid = ids >= 0
-            if valid.sum() == 0:
+            if not bool(valid.any()):
                 continue
 
-            uniq_segs = torch.unique(ids[valid], sorted=True)  # reading order
-            n_seg = uniq_segs.shape[0]
+            unique_segments = torch.unique(ids[valid], sorted=True)
+            for seg_value in unique_segments:
+                mask = ids == seg_value
+                indices = torch.nonzero(
+                    mask,
+                    as_tuple=False,
+                ).squeeze(-1)
 
-            seg_vecs = torch.zeros(n_seg, H, device=device, dtype=text_hidden.dtype)
-            seg_masks = []
-            for i, s in enumerate(uniq_segs):
-                mask = ids == s
-                seg_masks.append(mask)
-                seg_vecs[i] = text_hidden[b, mask].mean(dim=0)
+                # Only the I/middle/last tokens get the token shortcut.
+                if int(indices.numel()) > 1:
+                    mask_out[b, indices[1:]] = True
 
-            # The only place adjacent segments exchange information.
-            # Cheap: n_seg is typically tens, not hundreds, per document.
-            ctx_out = self.segment_context(seg_vecs.unsqueeze(0)).squeeze(0)  # (n_seg, H)
-            # ReZero blend: at init (gate=0) this reduces to seg_vecs_ctx == seg_vecs
-            # (pure mean-pooling, no context) -- see comment on self.segment_context_gate.
-            seg_vecs_ctx = seg_vecs + self.segment_context_gate * (ctx_out - seg_vecs)
+        return mask_out
 
-            for i, mask in enumerate(seg_masks):
-                broadcast_hidden[b, mask] = seg_vecs_ctx[i]
+    def _segment_pool_and_contextualize(self, text_hidden, seg_id):
+        """
+        Hard segment mean-pooling + reading-order context.
+
+        Every token in a valid segment receives the same segment-context
+        vector. The first-token embedding is added later in forward().
+        """
+        B, L, H = text_hidden.shape
+        device = text_hidden.device
+
+        if seg_id.ndim != 2 or tuple(seg_id.shape) != (B, L):
+            raise ValueError(
+                "seg_id must have shape (batch, text_len) matching text_hidden; "
+                f"got seg_id={tuple(seg_id.shape)}, "
+                f"text_hidden={tuple(text_hidden.shape)}"
+            )
+
+        broadcast_hidden = text_hidden.clone()
+        gate = self.segment_context_gate
+        max_pos = self.segment_position_embedding.num_embeddings
+
+        for b in range(B):
+            ids = seg_id[b]
+            valid = ids >= 0
+            if not bool(valid.any()):
+                continue
+
+            unique_segments = torch.unique(
+                ids[valid],
+                sorted=True,
+            )
+            n_seg = int(unique_segments.numel())
+
+            segment_vectors = torch.zeros(
+                n_seg,
+                H,
+                device=device,
+                dtype=text_hidden.dtype,
+            )
+            segment_masks = []
+
+            for i, seg_value in enumerate(unique_segments):
+                mask = ids == seg_value
+                segment_masks.append(mask)
+                segment_vectors[i] = text_hidden[b, mask].mean(dim=0)
+
+            positions = torch.arange(
+                n_seg,
+                device=device,
+            ).clamp(max=max_pos - 1)
+
+            segment_input = (
+                segment_vectors
+                + self.segment_position_embedding(positions)
+            )
+            context_out = self.segment_context(
+                segment_input.unsqueeze(0)
+            ).squeeze(0)
+
+            segment_vectors_context = (
+                segment_vectors
+                + gate * (context_out - segment_vectors)
+            )
+
+            for i, mask in enumerate(segment_masks):
+                broadcast_hidden[b, mask] = segment_vectors_context[i]
 
         return broadcast_hidden
-    def _compute_boundary_loss(self, text_hidden, entity_ids, attention_mask, text_len):
-        """
-        Intra-Line/Entity Boundary Loss -- bản vector hóa, dùng entity_ids
-        (đã tính sẵn từ chuỗi nhãn thật "B-.../I-...", không suy luận theo
-        số chẵn/lẻ -> tổng quát cho mọi dataset).
-
-        Với mỗi cặp token liên tiếp (i, i+1):
-            boundary_label = 0  nếu cùng entity_ids (đang ở giữa 1 entity)
-            boundary_label = 1  nếu khác entity_ids (ranh giới thật)
-        Token có entity_ids = -1 (O / special / padding) bị loại khỏi loss.
-        """
-        device = text_hidden.device
-
-        if entity_ids is None:
-            return torch.tensor(0.0, device=device)
-
-        h_i = text_hidden[:, :-1, :]        # (B, L-1, H)
-        h_next = text_hidden[:, 1:, :]      # (B, L-1, H)
-        h_pair = torch.cat([h_i, h_next], dim=-1)                    # (B, L-1, 2H)
-        boundary_logits = self.boundary_classifier(h_pair).squeeze(-1)  # (B, L-1)
-
-        ent_i = entity_ids[:, :-1]
-        ent_next = entity_ids[:, 1:]
-
-        valid = (ent_i >= 0) & (ent_next >= 0)
-        if attention_mask is not None:
-            am = attention_mask[:, :text_len]
-            valid = valid & (am[:, :-1] == 1) & (am[:, 1:] == 1)
-
-        if valid.sum() == 0:
-            return torch.tensor(0.0, device=device)
-
-        boundary_labels = (ent_i != ent_next).float()
-
-        return F.binary_cross_entropy_with_logits(
-            boundary_logits[valid], boundary_labels[valid]
-        )
-
-    def _compute_disentangle_loss(self, text_hidden, line_ids, block_ids, 
-                                attention_mask, text_len):
-        device = text_hidden.device
-        B = text_hidden.shape[0]
-        
-        # Cắt line_ids, block_ids về text_len
-        if line_ids is not None and line_ids.shape[1] > text_len:
-            line_ids = line_ids[:, :text_len]
-        if block_ids is not None and block_ids.shape[1] > text_len:
-            block_ids = block_ids[:, :text_len]
-        
-        h_geo = self.geo_head(text_hidden)
-        h_semi = self.semi_head(text_hidden)
-        
-        # ====== GEOMETRY LOSS ======
-        geo_loss = torch.tensor(0.0, device=device)
-        
-        if line_ids is not None:
-            line_logits = self.geo_line_classifier(h_geo)
-            block_logits = self.geo_block_classifier(h_geo)
-            
-            valid_mask = (line_ids >= 0) & (block_ids >= 0)
-            if attention_mask is not None:
-                text_attention_mask = attention_mask[:, :text_len]
-                valid_mask = valid_mask & (text_attention_mask == 1)
-            
-            if valid_mask.sum() > 0:
-                line_ids_clamped = torch.clamp(line_ids, 0, self.geo_line_classifier.out_features - 1)
-                block_ids_clamped = torch.clamp(block_ids, 0, self.geo_block_classifier.out_features - 1)
-                
-                geo_loss_line = F.cross_entropy(
-                    line_logits[valid_mask], 
-                    line_ids_clamped[valid_mask]
-                )
-                geo_loss_block = F.cross_entropy(
-                    block_logits[valid_mask],
-                    block_ids_clamped[valid_mask]
-                )
-                geo_loss = geo_loss_line + geo_loss_block
-                
-                # ====== KIỂM TRA NaN ======
-                if torch.isnan(geo_loss) or torch.isinf(geo_loss):
-                    geo_loss = torch.tensor(0.0, device=device)
-        
-        # ====== ORTHOGONALITY LOSS ======
-        h_geo_norm = F.normalize(h_geo, dim=-1)
-        h_semi_norm = F.normalize(h_semi, dim=-1)
-        
-        cos_sim = torch.matmul(h_geo_norm, h_semi_norm.transpose(1, 2))
-        
-        if attention_mask is not None:
-            text_attention_mask = attention_mask[:, :text_len]
-            valid_mask_2d = text_attention_mask.bool()
-            pair_mask = valid_mask_2d.unsqueeze(1) & valid_mask_2d.unsqueeze(2)
-            cos_sim = cos_sim * pair_mask.float()
-        
-        orth_loss = (cos_sim ** 2).mean()
-        
-        # ====== KIỂM TRA NaN ======
-        if torch.isnan(orth_loss) or torch.isinf(orth_loss):
-            orth_loss = torch.tensor(0.0, device=device)
-        
-        return geo_loss, orth_loss
 
     def forward(
         self,
@@ -287,14 +356,17 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
         line_ids=None,
         block_ids=None,
         column_ids=None,
-        entity_ids=None, 
+        entity_ids=None,
         output_attentions=None,
         output_hidden_states=None,
         return_dict=None,
         images=None,
-        
     ):
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = (
+            return_dict
+            if return_dict is not None
+            else self.config.use_return_dict
+        )
 
         outputs = self.layoutlmv3(
             input_ids,
@@ -311,102 +383,126 @@ class LayoutLMv3ForSegmentTokenClassification(LayoutLMv3PreTrainedModel):
             valid_span=valid_span,
             line_ids=line_ids,
             block_ids=block_ids,
-            column_ids=column_ids, 
+            column_ids=column_ids,
         )
 
-        sequence_output = outputs[0]  # (B, text_len + image_len, H)
-        text_len = input_ids.shape[1]
+        sequence_output = outputs[0]
+
+        if input_ids is not None:
+            text_len = input_ids.shape[1]
+        elif inputs_embeds is not None:
+            text_len = inputs_embeds.shape[1]
+        else:
+            raise ValueError(
+                "Either input_ids or inputs_embeds must be provided"
+            )
+
         text_hidden = sequence_output[:, :text_len, :]
         image_hidden = sequence_output[:, text_len:, :]
 
-        # ====== SỬA: Cắt seg_id để chỉ lấy phần text ======
         if seg_id is not None:
-            # Đảm bảo seg_id có đúng độ dài text
-            if seg_id.shape[1] != text_len:
-                # Nếu seg_id dài hơn text_len, chỉ lấy phần text
-                if seg_id.shape[1] > text_len:
-                    seg_id = seg_id[:, :text_len]
-                else:
-                    # Nếu seg_id ngắn hơn, pad với -1
-                    pad_len = text_len - seg_id.shape[1]
-                    pad_tensor = torch.ones(seg_id.shape[0], pad_len, device=seg_id.device, dtype=seg_id.dtype) * -1
-                    seg_id = torch.cat([seg_id, pad_tensor], dim=1)
-            
-            text_hidden = self._segment_pool_and_contextualize(text_hidden, seg_id)
+            seg_id = self._normalize_seg_id(seg_id, text_len)
 
-            # Add the is-first-token-of-segment signal
-            is_first = torch.zeros_like(seg_id, dtype=torch.long)
-            is_first[:, 0] = 0
-            if seg_id.shape[1] > 1:
-                prev = seg_id[:, :-1]
-                cur = seg_id[:, 1:]
-                changed = (cur != prev) & (cur >= 0)
-                is_first[:, 1:] = changed.long()
-            is_first = is_first * (seg_id >= 0).long()
+            # --------------------------------------------------------------
+            # Main segment path: this is the model's dominant representation.
+            # --------------------------------------------------------------
+            segment_hidden = self._segment_pool_and_contextualize(
+                text_hidden,
+                seg_id,
+            )
 
-            text_hidden = text_hidden + self.is_first_token_embedding(is_first)
+            first_flags = self._build_first_token_flags(seg_id)
+            first_embedding = self.is_first_token_embedding(first_flags)
+
+            segment_hidden = segment_hidden + first_embedding
+
+            # --------------------------------------------------------------
+            # Token shortcut.
+            # --------------------------------------------------------------
+            # Use the SAME classifier weights as the segment path. This keeps
+            # the new branch parameter-light and avoids another high-LR head.
+            token_hidden = text_hidden + first_embedding
+
+            # Both paths use the same dropout layer implementation. The
+            # shortcut only matters on non-first tokens of multi-token
+            # segments, where collapsing to one pooled vector loses information.
+            segment_for_classifier = self.dropout(segment_hidden)
+            token_for_classifier = self.dropout(token_hidden)
+
+            segment_logits_text = self.classifier(segment_for_classifier)
+            token_logits_text = self.classifier(token_for_classifier)
+
+            # Positive bounded mixing coefficient, initially small.
+            alpha = self.token_blend_max * torch.sigmoid(
+                self.token_blend_raw
+            )
+
+            shortcut_mask = self._build_nonfirst_multitoken_mask(seg_id)
+            shortcut_mask = shortcut_mask.unsqueeze(-1)
+
+            logits_text = segment_logits_text + (
+                alpha
+                * shortcut_mask.to(segment_logits_text.dtype)
+                * (token_logits_text - segment_logits_text)
+            )
+        else:
+            # Vanilla fallback when no seg_id is supplied.
+            classifier_sequence = self.dropout(text_hidden)
+            logits_text = self.classifier(classifier_sequence)
 
         if image_hidden.shape[1] > 0:
-            pooled_sequence = torch.cat([text_hidden, image_hidden], dim=1)
+            if seg_id is not None:
+                # Text branch has already passed through its classifier.
+                # Image tokens still use the original classifier path.
+                image_for_classifier = self.dropout(image_hidden)
+                logits_image = self.classifier(image_for_classifier)
+                logits = torch.cat(
+                    [logits_text, logits_image],
+                    dim=1,
+                )
+            else:
+                image_for_classifier = self.dropout(image_hidden)
+                logits_image = self.classifier(image_for_classifier)
+                logits = torch.cat(
+                    [logits_text, logits_image],
+                    dim=1,
+                )
         else:
-            pooled_sequence = text_hidden
+            logits = logits_text
 
-        pooled_sequence = self.dropout(pooled_sequence)
-        logits = self.classifier(pooled_sequence)
-        # ====== TÍNH CÁC LOSS PHỤ ======
-        aux_loss = torch.tensor(0.0, device=logits.device)
-
-        if labels is not None:
-            # ====== INTRA-LINE BOUNDARY LOSS ======
-            if self.boundary_classifier is not None:
-                entity_ids_for_loss = entity_ids
-                if entity_ids_for_loss is not None and entity_ids_for_loss.shape[1] != text_len:
-                    if entity_ids_for_loss.shape[1] > text_len:
-                        entity_ids_for_loss = entity_ids_for_loss[:, :text_len]
-                    else:
-                        pad_len = text_len - entity_ids_for_loss.shape[1]
-                        pad_tensor = torch.ones(
-                            entity_ids_for_loss.shape[0], pad_len,
-                            device=entity_ids_for_loss.device, dtype=entity_ids_for_loss.dtype
-                        ) * -1
-                        entity_ids_for_loss = torch.cat([entity_ids_for_loss, pad_tensor], dim=1)
-
-                boundary_loss = self._compute_boundary_loss(
-                    text_hidden=sequence_output[:, :text_len, :],
-                    entity_ids=entity_ids_for_loss,   # thay labels bằng entity_ids đã tính đúng
-                    attention_mask=attention_mask,
-                    text_len=text_len,
-                )
-                aux_loss = aux_loss + self.lambda_bound * boundary_loss
-            
-            # ====== SEMANTIC-GEOMETRY DISENTANGLE LOSS ======
-            if self.geo_head is not None:
-                geo_loss, orth_loss = self._compute_disentangle_loss(
-                    text_hidden=sequence_output[:, :text_len, :],
-                    line_ids=line_ids if line_ids is not None else None,
-                    block_ids=block_ids if block_ids is not None else None,
-                    attention_mask=attention_mask,
-                    text_len=text_len,
-                )
-                aux_loss = aux_loss + self.lambda_geo * geo_loss + self.lambda_orth * orth_loss
         loss = None
         if labels is not None:
             loss_fct = CrossEntropyLoss()
+
             if attention_mask is not None:
                 active_loss = attention_mask.view(-1) == 1
                 active_logits = logits.view(-1, self.num_labels)
-                active_labels = torch.where(
-                    active_loss, labels.view(-1), torch.tensor(loss_fct.ignore_index).type_as(labels)
+                ignore_labels = torch.full_like(
+                    labels.view(-1),
+                    loss_fct.ignore_index,
                 )
-                loss = loss_fct(active_logits, active_labels)
+                active_labels = torch.where(
+                    active_loss,
+                    labels.view(-1),
+                    ignore_labels,
+                )
+                loss = loss_fct(
+                    active_logits,
+                    active_labels,
+                )
             else:
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-
-            loss = loss + aux_loss
+                loss = loss_fct(
+                    logits.view(-1, self.num_labels),
+                    labels.view(-1),
+                )
 
         if not return_dict:
             output = (logits,) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
+            return (
+                (loss,) + output
+                if loss is not None
+                else output
+            )
 
         return TokenClassifierOutput(
             loss=loss,

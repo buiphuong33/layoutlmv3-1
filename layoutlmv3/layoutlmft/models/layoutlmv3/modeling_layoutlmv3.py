@@ -1,3 +1,4 @@
+# modeling_layoutlmv3.py
 # coding=utf-8
 # Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
 # Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
@@ -101,35 +102,6 @@ class LayoutLMv3Embeddings(nn.Module):
         self.y_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.coordinate_size)
         self.h_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.shape_size)
         self.w_position_embeddings = nn.Embedding(config.max_2d_position_embeddings, config.shape_size)
-        # NEW: Hierarchical position embeddings
-        if getattr(config, "use_hierarchical_position_encoding", False):
-            self.line_position_embeddings = nn.Embedding(
-                config.max_line_position, config.coordinate_size
-            )
-            self.block_position_embeddings = nn.Embedding(
-                config.max_block_position, config.coordinate_size
-            )
-            if getattr(config, "use_column_encoding", False):
-                self.column_position_embeddings = nn.Embedding(
-                    config.max_column_position,
-                    config.coordinate_size
-                )
-                self.hierarchical_proj = nn.Linear(
-                    config.coordinate_size * 3,  # line + block + column
-                    config.hidden_size
-                )
-            else:
-                self.column_position_embeddings = None
-                self.hierarchical_proj = nn.Linear(
-                    config.coordinate_size * 2,  # line + block
-                    config.hidden_size
-                )
-    
-        else:
-            self.line_position_embeddings = None
-            self.block_position_embeddings = None
-            self.column_position_embeddings = None
-            self.hierarchical_proj = None
 
     def _calc_spatial_position_embeddings(self, bbox):
         try:
@@ -181,9 +153,6 @@ class LayoutLMv3Embeddings(nn.Module):
         position_ids=None,
         inputs_embeds=None,
         past_key_values_length=0,
-        line_ids=None,      
-        block_ids=None,
-        column_ids=None,
     ):
         if position_ids is None:
             if input_ids is not None:
@@ -213,49 +182,6 @@ class LayoutLMv3Embeddings(nn.Module):
 
         embeddings = embeddings + spatial_position_embeddings
 
-        embeddings = self.LayerNorm(embeddings)
-        embeddings = self.dropout(embeddings)
-
-        if self.line_position_embeddings is not None and line_ids is not None and block_ids is not None:
-            # Đảm bảo line_ids và block_ids có cùng shape với embeddings
-            if line_ids.dim() == 2 and line_ids.shape[1] != embeddings.shape[1]:
-                # Nếu độ dài khác nhau, cắt hoặc pad
-                if line_ids.shape[1] > embeddings.shape[1]:
-                    line_ids = line_ids[:, :embeddings.shape[1]]
-                    block_ids = block_ids[:, :embeddings.shape[1]]
-                else:
-                    # Pad với -1
-                    pad_len = embeddings.shape[1] - line_ids.shape[1]
-                    line_ids = torch.cat([line_ids, torch.ones(line_ids.shape[0], pad_len, device=line_ids.device, dtype=line_ids.dtype) * -1], dim=1)
-                    block_ids = torch.cat([block_ids, torch.ones(block_ids.shape[0], pad_len, device=block_ids.device, dtype=block_ids.dtype) * -1], dim=1)
-            
-            # Clamp để tránh index out of range
-            line_ids_clamped = torch.clamp(line_ids, 0, self.line_position_embeddings.num_embeddings - 1)
-            block_ids_clamped = torch.clamp(block_ids, 0, self.block_position_embeddings.num_embeddings - 1)
-            
-            line_emb = self.line_position_embeddings(line_ids_clamped)
-            block_emb = self.block_position_embeddings(block_ids_clamped)
-            if self.column_position_embeddings is not None and column_ids is not None:
-                column_ids_clamped = torch.clamp(column_ids, 0, self.column_position_embeddings.num_embeddings - 1)
-                column_emb = self.column_position_embeddings(column_ids_clamped)
-                column_weight = 0.3
-                column_emb = column_weight * column_emb
-                concat_emb = torch.cat([line_emb, block_emb, column_emb], dim=-1)
-            else:
-                concat_emb = torch.cat([line_emb, block_emb], dim=-1)
-            hier_emb = self.hierarchical_proj(concat_emb)
-        
-            # Đảm bảo cùng shape
-            if hier_emb.shape[1] == embeddings.shape[1]:
-                embeddings = embeddings + hier_emb
-            elif hier_emb.shape[1] > embeddings.shape[1]:
-                embeddings = embeddings + hier_emb[:, :embeddings.shape[1], :]
-            else:
-                pad_len = embeddings.shape[1] - hier_emb.shape[1]
-                pad_zeros = torch.zeros(hier_emb.shape[0], pad_len, hier_emb.shape[2], device=hier_emb.device)
-                hier_emb_padded = torch.cat([hier_emb, pad_zeros], dim=1)
-                embeddings = embeddings + hier_emb_padded
-        
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
@@ -429,10 +355,190 @@ class LayoutLMv3SelfAttention(nn.Module):
         return outputs
 
 
-class LayoutLMv3Attention(nn.Module):
+class NSSRSelfAttention(nn.Module):
+    """
+    Non-Saturating Structural Resonance Self-Attention.
+    - Semantic stream: softmax bình thường
+    - Geometric stream (hoặc Topological stream nếu use_atga=True): distance-based
+    - Fusion: orthogonal projection residual
+    """
     def __init__(self, config):
         super().__init__()
-        self.self = LayoutLMv3SelfAttention(config)
+        if config.hidden_size % config.num_attention_heads != 0:
+            raise ValueError(
+                f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
+                f"heads ({config.num_attention_heads})"
+            )
+
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+
+        self.query = nn.Linear(config.hidden_size, self.all_head_size)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+
+        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+        self.has_relative_attention_bias = config.has_relative_attention_bias
+        self.has_spatial_attention_bias = config.has_spatial_attention_bias
+        
+        # ★ NSSR params
+        self.use_atga = getattr(config, 'use_atga', False)
+        self.gamma_tt = nn.Parameter(torch.tensor(0.0))
+        self.geo_sigma = nn.Parameter(torch.tensor(0.5))  # init 0.5, không phải 0.1
+        # ATGA params (chỉ dùng nếu use_atga)
+        self.topo_gate = nn.Linear(1, config.num_attention_heads)
+        nn.init.zeros_(self.topo_gate.weight)
+        nn.init.zeros_(self.topo_gate.bias)
+
+    def transpose_for_scores(self, x):
+        new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
+        x = x.view(*new_x_shape)
+        return x.permute(0, 2, 1, 3)
+
+    def cogview_attn(self, attention_scores, alpha=32):
+        scaled = attention_scores / alpha
+        max_val = scaled.amax(dim=(-1)).unsqueeze(-1)
+        new_scores = (scaled - max_val) * alpha
+        return nn.Softmax(dim=-1)(new_scores)
+
+    def build_topological_adjacency(self, bbox_text, extended_mask=None, k=5):
+        """Topological stream: row/column + k-NN adjacency."""
+        B, N_text, _ = bbox_text.shape
+        device = bbox_text.device
+        bbox_norm = bbox_text.float() / 1000.0
+        
+        x_center = (bbox_norm[..., 0] + bbox_norm[..., 2]) / 2
+        y_center = (bbox_norm[..., 1] + bbox_norm[..., 3]) / 2
+        x_width = (bbox_norm[..., 2] - bbox_norm[..., 0]).clamp(min=1e-3)
+        y_height = (bbox_norm[..., 3] - bbox_norm[..., 1]).clamp(min=1e-3)
+        
+        y_top = y_center - y_height / 2
+        y_bot = y_center + y_height / 2
+        y_overlap = (torch.min(y_bot.unsqueeze(2), y_bot.unsqueeze(1)) 
+                     - torch.max(y_top.unsqueeze(2), y_top.unsqueeze(1))).clamp(min=0)
+        min_height = torch.min(y_height.unsqueeze(2), y_height.unsqueeze(1))
+        same_row = (y_overlap > 0.5 * min_height).float()
+        
+        x_left = x_center - x_width / 2
+        x_right = x_center + x_width / 2
+        x_overlap = (torch.min(x_right.unsqueeze(2), x_right.unsqueeze(1)) 
+                     - torch.max(x_left.unsqueeze(2), x_left.unsqueeze(1))).clamp(min=0)
+        min_width = torch.min(x_width.unsqueeze(2), x_width.unsqueeze(1))
+        same_col = (x_overlap > 0.5 * min_width).float()
+        
+        A_topo = (same_row + same_col).clamp(max=1.0)
+        
+        # k-NN fallback
+        dist = torch.cdist(bbox_norm, bbox_norm, p=2)
+        topk_vals, topk_idx = dist.topk(k + 1, dim=-1, largest=False)
+        knn_mask = torch.zeros_like(dist)
+        knn_mask.scatter_(-1, topk_idx, 1.0)
+        A_topo = torch.max(A_topo, knn_mask)
+        
+        # Self-loop
+        eye = torch.eye(N_text, device=device).unsqueeze(0)
+        A_topo = torch.max(A_topo, eye)
+        
+        # Mask padding
+        if extended_mask is not None:
+            key_mask = (extended_mask[:, 0, 0, :N_text] > -1000).float()
+            A_topo = A_topo * key_mask.unsqueeze(1)
+            A_topo = A_topo * key_mask.unsqueeze(2)
+        
+        A_topo = A_topo / A_topo.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        return A_topo.float()
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        past_key_value=None,
+        output_attentions=False,
+        rel_pos=None,
+        rel_2d_pos=None,
+        bbox=None,
+        text_token_count=None,
+    ):
+        mixed_query_layer = self.query(hidden_states)
+        key_layer = self.transpose_for_scores(self.key(hidden_states))
+        value_layer = self.transpose_for_scores(self.value(hidden_states))
+        query_layer = self.transpose_for_scores(mixed_query_layer)
+
+        attention_scores = torch.matmul(
+            query_layer / math.sqrt(self.attention_head_size), 
+            key_layer.transpose(-1, -2)
+        )
+        if self.has_relative_attention_bias and self.has_spatial_attention_bias:
+            attention_scores += (rel_pos + rel_2d_pos) / math.sqrt(self.attention_head_size)
+        elif self.has_relative_attention_bias:
+            attention_scores += rel_pos / math.sqrt(self.attention_head_size)
+        if attention_mask is not None:
+            attention_scores = attention_scores + attention_mask
+
+        # ★ NSSR PATH
+        if text_token_count is not None and bbox is not None:
+            context_layer, attention_probs = self._nssr_forward(
+                attention_scores, value_layer, bbox, text_token_count, attention_mask
+            )
+        else:
+            attention_probs = self.dropout(self.cogview_attn(attention_scores))
+            if head_mask is not None:
+                attention_probs = attention_probs * head_mask
+            context_layer = torch.matmul(attention_probs, value_layer)
+
+        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+        context_layer = context_layer.view(*(context_layer.size()[:-2] + (self.all_head_size,)))
+        return (context_layer, attention_probs) if output_attentions else (context_layer,)
+
+    def _nssr_forward(self, attention_scores, value_layer, bbox, N_text, extended_mask=None):
+        B, H, N, _ = attention_scores.shape
+        A_sem = self.dropout(self.cogview_attn(attention_scores))
+        O_sem = torch.matmul(A_sem, value_layer)
+        O_text_sem = O_sem[:, :, :N_text]
+        O_vis = O_sem[:, :, N_text:]
+
+        bbox_text = bbox[:, :N_text, :]
+        V_text = value_layer[:, :, :N_text]
+
+        if self.use_atga:
+            # ★ Topological stream
+            A_geo = self.build_topological_adjacency(bbox_text, extended_mask, k=5)
+            A_geo_gated = torch.sigmoid(self.topo_gate(A_geo.unsqueeze(-1)))  # [B, Nt, Nt, H]
+            A_geo_gated = A_geo_gated.permute(0, 3, 1, 2)  # [B, H, Nt, Nt]
+            A_geo_gated = A_geo_gated / A_geo_gated.sum(-1, keepdim=True).clamp(min=1e-6)
+            O_geo = torch.matmul(A_geo_gated, V_text)
+        else:
+            # ★ Geometric stream (inverse distance)
+            b = bbox_text.float() / 1000.
+            cx = (b[..., 0] + b[..., 2]) / 2
+            cy = (b[..., 1] + b[..., 3]) / 2
+            d = (cx.unsqueeze(2) - cx.unsqueeze(1)).abs() + (cy.unsqueeze(2) - cy.unsqueeze(1)).abs()
+            sigma = self.geo_sigma.abs().clamp(min=1e-3)
+            A_geo = torch.exp(-d / sigma)
+            if extended_mask is not None:
+                key_mask = (extended_mask[:, 0, 0, :N_text] > -1000).float()
+                A_geo = A_geo * key_mask.unsqueeze(1)
+            A_geo = A_geo / A_geo.sum(-1, keepdim=True).clamp(min=1e-6)
+            O_geo = torch.matmul(A_geo.unsqueeze(1).expand(-1, H, -1, -1).to(V_text.dtype), V_text)
+
+        # Orthogonal residual
+        coef = (O_geo * O_text_sem).sum(-1, keepdim=True) / (O_text_sem * O_text_sem).sum(-1, keepdim=True).clamp(min=1e-6)
+        residual = O_geo - coef * O_text_sem
+        gamma_clamped = 0.3 * torch.tanh(self.gamma_tt)
+        O_text = O_text_sem + gamma_clamped * residual
+        return torch.cat([O_text, O_vis], dim=2), A_sem
+    
+class LayoutLMv3Attention(nn.Module):
+    def __init__(self, config,  use_nssr=False):
+        super().__init__()
+        if use_nssr:
+            self.self = NSSRSelfAttention(config)
+        else:
+            self.self = LayoutLMv3SelfAttention(config)
         self.output = RobertaSelfOutput(config)
         self.pruned_heads = set()
 
@@ -465,6 +571,8 @@ class LayoutLMv3Attention(nn.Module):
         output_attentions=False,
         rel_pos=None,
         rel_2d_pos=None,
+        bbox=None,
+        text_token_count=None,
     ):
         self_outputs = self.self(
             hidden_states,
@@ -476,6 +584,8 @@ class LayoutLMv3Attention(nn.Module):
             output_attentions,
             rel_pos=rel_pos,
             rel_2d_pos=rel_2d_pos,
+            bbox=bbox,
+            text_token_count=text_token_count,
         )
         attention_output = self.output(self_outputs[0], hidden_states)
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
@@ -483,11 +593,11 @@ class LayoutLMv3Attention(nn.Module):
 
 
 class LayoutLMv3Layer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, use_nssr=False):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
-        self.attention = LayoutLMv3Attention(config)
+        self.attention = LayoutLMv3Attention(config, use_nssr=use_nssr)
         assert not config.is_decoder and not config.add_cross_attention, \
             "This version do not support decoder. Please refer to RoBERTa for implementation of is_decoder."
         self.intermediate = RobertaIntermediate(config)
@@ -504,6 +614,8 @@ class LayoutLMv3Layer(nn.Module):
         output_attentions=False,
         rel_pos=None,
         rel_2d_pos=None,
+        bbox=None,
+        text_token_count=None,
     ):
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
@@ -515,6 +627,8 @@ class LayoutLMv3Layer(nn.Module):
             past_key_value=self_attn_past_key_value,
             rel_pos=rel_pos,
             rel_2d_pos=rel_2d_pos,
+            bbox=bbox, 
+            text_token_count=text_token_count,
         )
         attention_output = self_attention_outputs[0]
 
@@ -534,11 +648,12 @@ class LayoutLMv3Layer(nn.Module):
 
 
 class LayoutLMv3Encoder(nn.Module):
-    def __init__(self, config, detection=False, out_features=None):
+    def __init__(self, config, detection=False, out_features=None, use_nssr=False):
         super().__init__()
         self.config = config
         self.detection = detection
-        self.layer = nn.ModuleList([LayoutLMv3Layer(config) for _ in range(config.num_hidden_layers)])
+        self.use_nssr = use_nssr
+        self.layer = nn.ModuleList([LayoutLMv3Layer(config, use_nssr=use_nssr) for _ in range(config.num_hidden_layers)])
         self.gradient_checkpointing = False
 
         self.has_relative_attention_bias = config.has_relative_attention_bias
@@ -668,6 +783,7 @@ class LayoutLMv3Encoder(nn.Module):
         Hp=None,
         Wp=None,
         valid_span=None,
+        text_token_count=None,
     ):
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
@@ -706,6 +822,13 @@ class LayoutLMv3Encoder(nn.Module):
                         # (or directly access saved tensors after they have already been freed).
                     return custom_forward
 
+                if text_token_count is not None:
+                    text_token_count_tensor = torch.tensor(
+                        text_token_count, device=hidden_states.device, dtype=torch.long
+                    )
+                else:
+                    text_token_count_tensor = torch.tensor(-1, device=hidden_states.device, dtype=torch.long)
+
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(layer_module),
                     hidden_states,
@@ -716,7 +839,10 @@ class LayoutLMv3Encoder(nn.Module):
                     past_key_value,
                     output_attentions,
                     rel_pos,
-                    rel_2d_pos
+                    rel_2d_pos,
+                    bbox,              # ★ THÊM
+                    text_token_count,  # ★ THÊM
+                    use_reentrant=False
                 )
             else:
                 layer_outputs = layer_module(
@@ -729,6 +855,8 @@ class LayoutLMv3Encoder(nn.Module):
                     output_attentions,
                     rel_pos=rel_pos,
                     rel_2d_pos=rel_2d_pos,
+                    bbox=bbox, 
+                    text_token_count=text_token_count,
                 )
 
             hidden_states = layer_outputs[0]
@@ -778,7 +906,7 @@ class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"position_ids"]
 
     # Copied from transformers.models.bert.modeling_bert.BertModel.__init__ with Bert->Roberta
-    def __init__(self, config, detection=False, out_features=None, image_only=False):
+    def __init__(self, config, detection=False, out_features=None, image_only=False, use_nssr=False):
         super().__init__(config)
         self.config = config
         assert not config.is_decoder and not config.add_cross_attention, \
@@ -792,7 +920,7 @@ class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
 
         if not self.image_only:
             self.embeddings = LayoutLMv3Embeddings(config)
-        self.encoder = LayoutLMv3Encoder(config, detection=detection, out_features=out_features)
+        self.encoder = LayoutLMv3Encoder(config, detection=detection, out_features=out_features, use_nssr=use_nssr)
 
         if config.visual_embed:
             embed_dim = self.config.hidden_size
@@ -893,9 +1021,7 @@ class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
         images=None,
-        line_ids=None,      # NEW
-        block_ids=None, 
-        column_ids=None,
+        use_nssr=None
     ):
         r"""
         encoder_hidden_states  (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
@@ -941,8 +1067,10 @@ class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds or images")
 
+        text_token_count = None
         if not self.image_only:
             # past_key_values_length
+            text_token_count = input_shape[1]
             past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
 
             if attention_mask is None:
@@ -967,29 +1095,6 @@ class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
             if bbox is None:
                 bbox = torch.zeros(tuple(list(input_shape) + [4]), dtype=torch.long, device=device)
 
-            if line_ids is not None:
-                if line_ids.shape[1] != input_shape[1]:
-                    if line_ids.shape[1] > input_shape[1]:
-                        line_ids = line_ids[:, :input_shape[1]]
-                    else:
-                        pad_len = input_shape[1] - line_ids.shape[1]
-                        line_ids = torch.cat([line_ids, torch.ones(line_ids.shape[0], pad_len, device=device, dtype=line_ids.dtype) * -1], dim=1)
-            
-            if block_ids is not None:
-                if block_ids.shape[1] != input_shape[1]:
-                    if block_ids.shape[1] > input_shape[1]:
-                        block_ids = block_ids[:, :input_shape[1]]
-                    else:
-                        pad_len = input_shape[1] - block_ids.shape[1]
-                        block_ids = torch.cat([block_ids, torch.ones(block_ids.shape[0], pad_len, device=device, dtype=block_ids.dtype) * -1], dim=1)
-            if column_ids is not None:
-                if column_ids.shape[1] != input_shape[1]:
-                    if column_ids.shape[1] > input_shape[1]:
-                        column_ids = column_ids[:, :input_shape[1]]
-                    else:
-                        pad_len = input_shape[1] - column_ids.shape[1]
-                        column_ids = torch.cat([column_ids, torch.ones(column_ids.shape[0], pad_len, device=device, dtype=column_ids.dtype) * -1], dim=1)
-
             embedding_output = self.embeddings(
                 input_ids=input_ids,
                 bbox=bbox,
@@ -997,9 +1102,6 @@ class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
                 token_type_ids=token_type_ids,
                 inputs_embeds=inputs_embeds,
                 past_key_values_length=past_key_values_length,
-                line_ids=line_ids,    # NEW
-                block_ids=block_ids,  # NEW
-                column_ids=column_ids,
             )
 
         final_bbox = final_position_ids = None
@@ -1066,6 +1168,7 @@ class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
             Hp=Hp,
             Wp=Wp,
             valid_span=valid_span,
+            text_token_count=text_token_count,
         )
 
         if self.detection:
@@ -1123,14 +1226,20 @@ class LayoutLMv3ForTokenClassification(LayoutLMv3PreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-
-        self.layoutlmv3 = LayoutLMv3Model(config)
+        self.use_boundary = getattr(config, 'use_boundary', False)
+        self.boundary_lambda = getattr(config, 'boundary_lambda', 0.3)
+        
+        use_nssr = getattr(config, 'use_nssr', False)
+        self.layoutlmv3 = LayoutLMv3Model(config, use_nssr=use_nssr)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         if config.num_labels < 10:
             self.classifier = nn.Linear(config.hidden_size, config.num_labels)
         else:
             self.classifier = LayoutLMv3ClassificationHead(config, pool_feature=False)
-
+        
+        if self.use_boundary:
+            self.boundary_classifier = nn.Linear(config.hidden_size, 2)
+        
         self.init_weights()
 
     def forward(
@@ -1148,6 +1257,7 @@ class LayoutLMv3ForTokenClassification(LayoutLMv3PreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
         images=None,
+        boundary_labels=None
     ):
         r"""
         labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
@@ -1176,10 +1286,13 @@ class LayoutLMv3ForTokenClassification(LayoutLMv3PreTrainedModel):
         sequence_output = self.dropout(sequence_output)
         logits = self.classifier(sequence_output)
 
+        boundary_logits = None
+        if self.use_boundary:
+            boundary_logits = self.boundary_classifier(sequence_output)
+        
         loss = None
         if labels is not None:
             loss_fct = CrossEntropyLoss()
-            # Only keep active parts of the loss
             if attention_mask is not None:
                 active_loss = attention_mask.view(-1) == 1
                 active_logits = logits.view(-1, self.num_labels)
@@ -1189,14 +1302,31 @@ class LayoutLMv3ForTokenClassification(LayoutLMv3PreTrainedModel):
                 loss = loss_fct(active_logits, active_labels)
             else:
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-
+            
+            # ★ Add boundary loss
+            if self.use_boundary and boundary_labels is not None:
+                boundary_loss_fct = CrossEntropyLoss(
+                    weight=torch.tensor([1.0, 5.0], device=labels.device)
+                )
+                if attention_mask is not None:
+                    active_boundary = attention_mask.view(-1) == 1
+                    active_boundary_logits = boundary_logits.view(-1, 2)
+                    active_boundary_labels = torch.where(
+                        active_boundary,
+                        boundary_labels.view(-1),
+                        torch.tensor(-100).type_as(boundary_labels)
+                    )
+                    boundary_loss = boundary_loss_fct(active_boundary_logits, active_boundary_labels)
+                else:
+                    boundary_loss = boundary_loss_fct(boundary_logits.view(-1, 2), boundary_labels.view(-1))
+                loss = loss + self.boundary_lambda * boundary_loss
+        
         if not return_dict:
             output = (logits,) + outputs[2:]
             return ((loss,) + output) if loss is not None else output
-
+        
         return TokenClassifierOutput(
-            loss=loss,
-            logits=logits,
+            loss=loss, logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )

@@ -1,3 +1,4 @@
+# run_funsd_cord.py
 #!/usr/bin/env python
 # coding=utf-8
 import logging
@@ -10,7 +11,8 @@ import numpy as np
 from datasets import ClassLabel, load_dataset, load_metric
 
 import transformers
-import torch
+from layoutlmft.models.layoutlmv3 import LayoutLMv3ForTokenClassification
+from layoutlmft.models.layoutlmv3.configuration_layoutlmv3 import LayoutLMv3Config
 from layoutlmft.data import DataCollatorForKeyValueExtraction
 from transformers import (
     AutoConfig,
@@ -65,46 +67,6 @@ class ModelArguments:
             "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
             "with private models)."
         },
-    )
-    use_hierarchical_position_encoding: bool = field(
-        default=False,
-        metadata={"help": "Enable Hierarchical Position Encoding (HPE)"}
-    )
-    max_line_position: int = field(
-        default=50,
-        metadata={"help": "Maximum number of lines in a document for HPE"}
-    )
-    max_block_position: int = field(
-        default=20,
-        metadata={"help": "Maximum number of blocks in a document for HPE"}
-    )
-    use_column_encoding: bool = field(
-        default=False,
-        metadata={"help": "Enable Column Position Encoding"}
-    )
-    max_column_position: int = field(
-        default=10,
-        metadata={"help": "Maximum number of columns in a document"}
-    )
-    use_intra_line_boundary: bool = field(
-        default=False,
-        metadata={"help": "Enable Intra-Line Boundary Transition Parsing"}
-    )
-    lambda_bound_init: float = field(
-        default=0.1,
-        metadata={"help": "Initial weight for boundary loss"}
-    )
-    use_semantic_geometry_disentangle: bool = field(
-        default=False,
-        metadata={"help": "Enable Semantic-Geometry Disentanglement"}
-    )
-    lambda_geo_init: float = field(
-        default=0.1,
-        metadata={"help": "Initial weight for geometry loss"}
-    )
-    lambda_orth_init: float = field(
-        default=0.1,
-        metadata={"help": "Initial weight for orthogonality loss"}
     )
 
 
@@ -181,13 +143,6 @@ class DataTrainingArguments:
     )
     segment_level_layout: bool = field(default=True)
     visual_embed: bool = field(default=True)
-    use_segment_head: bool = field(
-        default=False,
-        metadata={
-            "help": "Use LayoutLMv3ForSegmentTokenClassification (segment-level pooling + "
-            "inter-segment context head) instead of the vanilla per-token classification head."
-        },
-    )
     data_dir: Optional[str] = field(default=None)
     input_size: int = field(default=224, metadata={"help": "images input size for backbone"})
     second_input_size: int = field(default=112, metadata={"help": "images input size for discrete vae"})
@@ -196,6 +151,10 @@ class DataTrainingArguments:
     second_interpolation: str = field(
         default='lanczos', metadata={"help": "Interpolation for discrete vae (random, bilinear, bicubic)"})
     imagenet_default_mean_and_std: bool = field(default=False, metadata={"help": ""})
+    use_nssr: bool = field(default=False, metadata={"help": "Use NSSR attention"})
+    use_atga: bool = field(default=False, metadata={"help": "Use ATGA (topological stream)"})
+    use_boundary: bool = field(default=False, metadata={"help": "Use boundary loss"})
+    boundary_lambda: float = field(default=0.3, metadata={"help": "Boundary loss weight"})
 
 
 def main():
@@ -298,24 +257,18 @@ def main():
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    config = AutoConfig.from_pretrained(
+    config = LayoutLMv3Config.from_pretrained(
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
         num_labels=num_labels,
         finetuning_task=data_args.task_name,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         input_size=data_args.input_size,
+        use_nssr=data_args.use_nssr,
+        use_atga=data_args.use_atga,
+        use_boundary=data_args.use_boundary,
+        boundary_lambda=data_args.boundary_lambda,
         use_auth_token=True if model_args.use_auth_token else None,
-        use_hierarchical_position_encoding=model_args.use_hierarchical_position_encoding,
-        max_line_position=model_args.max_line_position,
-        max_block_position=model_args.max_block_position,
-        use_column_encoding=model_args.use_column_encoding,
-        max_column_position=model_args.max_column_position,
-        use_intra_line_boundary=model_args.use_intra_line_boundary,
-        lambda_bound_init=model_args.lambda_bound_init,
-        use_semantic_geometry_disentangle=model_args.use_semantic_geometry_disentangle,
-        lambda_geo_init=model_args.lambda_geo_init,
-        lambda_orth_init=model_args.lambda_orth_init,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
@@ -326,29 +279,14 @@ def main():
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
     )
-    if getattr(data_args, "use_segment_head", False):
-        # NEW: segment-level pooling + inter-segment context head.
-        # See modeling_layoutlmv3_segment.py for the full design rationale.
-        from layoutlmft.models.layoutlmv3.modeling_layoutlmv3_segment import (
-    LayoutLMv3ForSegmentTokenClassification,
-)
-        model = LayoutLMv3ForSegmentTokenClassification.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
-    else:
-        model = AutoModelForTokenClassification.from_pretrained(
-            model_args.model_name_or_path,
-            from_tf=bool(".ckpt" in model_args.model_name_or_path),
-            config=config,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
-        )
+    model = LayoutLMv3ForTokenClassification.from_pretrained(
+        model_args.model_name_or_path,
+        from_tf=bool(".ckpt" in model_args.model_name_or_path),
+        config=config,
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        use_auth_token=True if model_args.use_auth_token else None,
+    )
 
     # Tokenizer check: this script requires a fast tokenizer.
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
@@ -372,7 +310,7 @@ def main():
             RandomResizedCropAndInterpolationWithTwoPic(
                 size=data_args.input_size, interpolation=data_args.train_interpolation),
         ])
-        import torch
+
         patch_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(
@@ -387,169 +325,40 @@ def main():
             padding=False,
             truncation=True,
             return_overflowing_tokens=True,
+            # We use this argument because the texts in our dataset are lists of words (with a label for each word).
             is_split_into_words=True,
         )
 
         labels = []
         bboxes = []
         images = []
-        seg_ids = []
-        line_ids_all = []    # NEW
-        block_ids_all = []   # NEW
-        column_ids_all = []
-        entity_ids_all = []
-
-        # Thêm vào tokenize_and_align_labels, cùng chỗ tính label_ids
-        def compute_entity_ids(label_ids_aligned, label_list):
-            """Gán 1 ID duy nhất cho mỗi entity liên tục, dựa trên chuỗi nhãn thật
-            (không suy luận theo số chẵn/lẻ) -> tổng quát cho mọi dataset/label order."""
-            entity_ids = []
-            current_id = -1
-            prev_type = None  # None nghĩa là đang ở "O" hoặc đầu chuỗi
-            for lid in label_ids_aligned:
-                if lid == -100:
-                    entity_ids.append(-1)
-                    continue
-                label_str = label_list[lid]
-                if label_str == "O":
-                    entity_ids.append(-1)
-                    prev_type = None
-                    continue
-                prefix, etype = label_str.split("-", 1)  # "B"/"I", "QUESTION"/...
-                if prefix == "B" or etype != prev_type:
-                    current_id += 1
-                entity_ids.append(current_id)
-                prev_type = etype
-            return entity_ids
-        
-        # Helper function để tính line_ids từ bbox
-        def compute_line_ids(bboxes, y_threshold=10):
-            """Gom các token có y_center gần nhau thành cùng 1 dòng"""
-            if not bboxes:
-                return []
-            # Tính y_center của mỗi bbox
-            y_centers = [(box[1] + box[3]) / 2 for box in bboxes]
-            # Sắp xếp và gom cụm
-            lines = []
-            current_line = 0
-            lines.append(current_line)
-            for i in range(1, len(y_centers)):
-                if abs(y_centers[i] - y_centers[i-1]) > y_threshold:
-                    current_line += 1
-                lines.append(current_line)
-            return lines
-        
-        # Helper function để tính block_ids từ bbox
-        def compute_block_ids(bboxes, x_threshold=50, y_threshold=30):
-            """Gom các token gần nhau thành cùng 1 block (dựa trên khoảng cách XY)"""
-            if not bboxes:
-                return []
-            # Tính center của mỗi bbox
-            centers = [((box[0] + box[2]) / 2, (box[1] + box[3]) / 2) for box in bboxes]
-            # Gán block ID đơn giản: các token có khoảng cách <= threshold
-            blocks = []
-            current_block = 0
-            blocks.append(current_block)
-            for i in range(1, len(centers)):
-                # Tính khoảng cách từ token hiện tại đến token trước
-                dx = centers[i][0] - centers[i-1][0]
-                dy = centers[i][1] - centers[i-1][1]
-                if abs(dx) > x_threshold or abs(dy) > y_threshold:
-                    current_block += 1
-                blocks.append(current_block)
-            return blocks
-        def compute_column_ids(bboxes, x_threshold=50):
-            """Gom các token theo cột dựa trên x_center"""
-            if not bboxes:
-                return []
-            # Tính x_center của mỗi token
-            x_centers = [(box[0] + box[2]) / 2 for box in bboxes]
-            
-            # Sắp xếp các token theo x_center
-            columns = []
-            current_col = 0
-            columns.append(current_col)
-            
-            for i in range(1, len(x_centers)):
-                # Nếu khoảng cách x lớn hơn ngưỡng → cột mới
-                if abs(x_centers[i] - x_centers[i-1]) > x_threshold:
-                    current_col += 1
-                columns.append(current_col)
-            return columns
-        
         for batch_index in range(len(tokenized_inputs["input_ids"])):
             word_ids = tokenized_inputs.word_ids(batch_index=batch_index)
             org_batch_index = tokenized_inputs["overflow_to_sample_mapping"][batch_index]
 
             label = examples[label_column_name][org_batch_index]
             bbox = examples["bboxes"][org_batch_index]
-
-            # NEW: Tính line_ids và block_ids cho các token gốc
-            line_ids_orig = compute_line_ids(bbox)
-            block_ids_orig = compute_block_ids(bbox)
-            column_ids_orig = compute_column_ids(bbox, x_threshold=50)
-
-            # NEW: recover segment boundaries (giữ nguyên code cũ)
-            word_seg_id = None
-            if getattr(data_args, "use_segment_head", False):
-                word_seg_id = []
-                seg_counter = -1
-                prev_bbox_tuple = None
-                for wb in bbox:
-                    wb_tuple = tuple(wb)
-                    if wb_tuple != prev_bbox_tuple:
-                        seg_counter += 1
-                        prev_bbox_tuple = wb_tuple
-                    word_seg_id.append(seg_counter)
-
             previous_word_idx = None
             label_ids = []
             bbox_inputs = []
-            seg_id_inputs = []
-            line_ids_aligned = []    # NEW
-            block_ids_aligned = []   # NEW
-            column_ids_aligned = []
-            
             for word_idx in word_ids:
+                # Special tokens have a word id that is None. We set the label to -100 so they are automatically
+                # ignored in the loss function.
                 if word_idx is None:
-                    # Special tokens
                     label_ids.append(-100)
                     bbox_inputs.append([0, 0, 0, 0])
-                    if word_seg_id is not None:
-                        seg_id_inputs.append(-1)
-                    line_ids_aligned.append(-1)     # NEW
-                    block_ids_aligned.append(-1)    # NEW
-                    column_ids_aligned.append(-1)
+                # We set the label for the first token of each word.
                 elif word_idx != previous_word_idx:
-                    # First token of a word
                     label_ids.append(label_to_id[label[word_idx]])
                     bbox_inputs.append(bbox[word_idx])
-                    if word_seg_id is not None:
-                        seg_id_inputs.append(word_seg_id[word_idx])
-                    line_ids_aligned.append(line_ids_orig[word_idx])     # NEW
-                    block_ids_aligned.append(block_ids_orig[word_idx])   # NEW
-                    column_ids_aligned.append(column_ids_orig[word_idx])
+                # For the other tokens in a word, we set the label to either the current label or -100, depending on
+                # the label_all_tokens flag.
                 else:
-                    # Subsequent tokens of the same word
                     label_ids.append(label_to_id[label[word_idx]] if data_args.label_all_tokens else -100)
                     bbox_inputs.append(bbox[word_idx])
-                    if word_seg_id is not None:
-                        seg_id_inputs.append(word_seg_id[word_idx])
-                    line_ids_aligned.append(line_ids_orig[word_idx])     # NEW
-                    block_ids_aligned.append(block_ids_orig[word_idx])   # NEW
-                    column_ids_aligned.append(column_ids_orig[word_idx])
                 previous_word_idx = word_idx
-                
             labels.append(label_ids)
             bboxes.append(bbox_inputs)
-            if word_seg_id is not None:
-                seg_ids.append(seg_id_inputs)
-            line_ids_all.append(line_ids_aligned)     # NEW
-            block_ids_all.append(block_ids_aligned)   # NEW
-            column_ids_all.append(column_ids_aligned)
-
-            entity_ids_aligned = compute_entity_ids(label_ids, label_list)  # NEW
-            entity_ids_all.append(entity_ids_aligned)
 
             if data_args.visual_embed:
                 ipath = examples["image_path"][org_batch_index]
@@ -560,13 +369,6 @@ def main():
 
         tokenized_inputs["labels"] = labels
         tokenized_inputs["bbox"] = bboxes
-        tokenized_inputs["line_ids"] = line_ids_all    # NEW
-        tokenized_inputs["block_ids"] = block_ids_all  # NEW
-        tokenized_inputs["column_ids"] = column_ids_all
-        tokenized_inputs["entity_ids"] = entity_ids_all  # NEW
-
-        if getattr(data_args, "use_segment_head", False):
-            tokenized_inputs["seg_id"] = seg_ids
         if data_args.visual_embed:
             tokenized_inputs["images"] = images
 
@@ -585,7 +387,6 @@ def main():
             num_proc=data_args.preprocessing_num_workers,
             load_from_cache_file=not data_args.overwrite_cache,
         )
-        
 
     if training_args.do_eval:
         validation_name = "test"
@@ -616,52 +417,16 @@ def main():
             load_from_cache_file=not data_args.overwrite_cache,
         )
 
+    boundary_label_ids = [i for i, l in enumerate(label_list) if l.startswith("B-")]
     # Data collator
     data_collator = DataCollatorForKeyValueExtraction(
         tokenizer,
         pad_to_multiple_of=8 if training_args.fp16 else None,
         padding=padding,
         max_length=512,
+        use_boundary=data_args.use_boundary,
+        boundary_label_ids=boundary_label_ids,
     )
-    # ====== KIỂM TRA BATCH DATA ======
-    # Tạo data collator và dataloader để kiểm tra
-    from torch.utils.data import DataLoader
-    temp_dataloader = DataLoader(
-        train_dataset,
-        batch_size=2,
-        collate_fn=data_collator,
-        shuffle=False
-    )
-    
-    # Lấy 1 batch
-    batch = next(iter(temp_dataloader))
-    
-    # Kiểm tra các keys trong batch
-    print("=" * 50)
-    print("KEYS IN BATCH:", batch.keys())
-    print("=" * 50)
-    
-    # Kiểm tra line_ids và block_ids có tồn tại không
-    if "line_ids" in batch:
-        print(f"✅ line_ids shape: {batch['line_ids'].shape}")
-        print(f"   line_ids sample: {batch['line_ids'][0][:10]}")  # 10 token đầu
-    else:
-        print("❌ line_ids NOT FOUND in batch!")
-    
-    if "block_ids" in batch:
-        print(f"✅ block_ids shape: {batch['block_ids'].shape}")
-        print(f"   block_ids sample: {batch['block_ids'][0][:10]}")
-    else:
-        print("❌ block_ids NOT FOUND in batch!")
-    
-    # Kiểm tra seg_id có bị xóa không
-    if "seg_id" in batch:
-        print(f"✅ seg_id shape: {batch['seg_id'].shape}")
-    else:
-        print("⚠️ seg_id NOT FOUND (có thể bị xóa trong data_collator)")
-    
-    print("=" * 50)
-    # ====== KẾT THÚC KIỂM TRA ======
 
     # Metrics
     metric = load_metric("seqeval")
@@ -698,30 +463,9 @@ def main():
                 "f1": results["overall_f1"],
                 "accuracy": results["overall_accuracy"],
             }
-    import torch
-    # Định nghĩa Trainer tùy chỉnh để tách biệt Learning Rate
-    class CustomTrainer(Trainer):
-        def create_optimizer(self):
-            if self.optimizer is None:
-                # Nhóm 1: Các tham số thuộc backbone LayoutLMv3
-                backbone_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" in n and p.requires_grad]
-                # Nhóm 2: Các tham số mới (segment_context, classifier, is_first_token_embedding, gate)
-                new_params = [p for n, p in self.model.named_parameters() if "layoutlmv3" not in n and p.requires_grad]
 
-                optimizer_grouped_parameters = [
-                    {"params": backbone_params, "lr": self.args.learning_rate}, # Dùng LR từ tham số truyền vào (VD: 1e-5)
-                    {"params": new_params, "lr":5e-4} # Ép cứng LR lớn hơn cho module mới
-                ]
-                
-                self.optimizer = torch.optim.AdamW(
-                    optimizer_grouped_parameters, 
-                    betas=(self.args.adam_beta1, self.args.adam_beta2),
-                    eps=self.args.adam_epsilon,
-                )
-            return self.optimizer
-
-    # Khởi tạo Trainer bằng CustomTrainer vừa tạo thay vì Trainer mặc định
-    trainer = CustomTrainer(
+    # Initialize our Trainer
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
@@ -730,16 +474,6 @@ def main():
         data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
-    # Initialize our Trainer
-    # trainer = Trainer(
-    #     model=model,
-    #     args=training_args,
-    #     train_dataset=train_dataset if training_args.do_train else None,
-    #     eval_dataset=eval_dataset if training_args.do_eval else None,
-    #     tokenizer=tokenizer,
-    #     data_collator=data_collator,
-    #     compute_metrics=compute_metrics,
-    # )
 
     # Training
     if training_args.do_train:
